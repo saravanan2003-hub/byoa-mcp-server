@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: byoa-mcp-server
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "3002"
+      # Set the following in the Render dashboard (sync: false = not in git)
+      - key: SCALEKIT_ENVIRONMENT_URL
+        sync: false
+      - key: SCALEKIT_CLIENT_ID
+        sync: false
+      - key: SCALEKIT_CLIENT_SECRET
+        sync: false
+      - key: SCALEKIT_RESOURCE_ID
+        sync: false
+      - key: MCP_BASE_URL
+        sync: false
+      # Protects the /configure endpoint — generate a random secret and set here
+      - key: CONFIGURE_SECRET
+        sync: false

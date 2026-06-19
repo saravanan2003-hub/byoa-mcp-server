@@ -1,0 +1,371 @@
+"""BYOA MCP server — own-authentication-service + FastMCP todo tools.
+
+This server does two things:
+
+  1. Serves FastMCP todo tools protected by Scalekit BYOA (ScalekitProvider
+     validates every tool-call access token against the registered MCP resource).
+
+  2. Acts as the "own authentication service" that Scalekit redirects the MCP
+     client browser to during the OAuth flow (/authorize + /login).
+
+Primary motive: detect and surface anything Scalekit sends incorrectly.
+  - /authorize: validates that Scalekit forwarded BOTH login_request_id and state
+    (missing → 400 + clear message, never silently render the form).
+  - /login: posts user_info to Scalekit and exposes the full status + body on any
+    non-2xx (never swallow Scalekit errors).
+
+Derived from github.com/scalekit-inc/mcp-auth-demos/tree/main/todo-fastmcp.
+"""
+
+import os
+import uuid
+from dataclasses import asdict, dataclass
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.scalekit import ScalekitProvider
+from fastmcp.server.dependencies import AccessToken, get_access_token
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+
+from scalekit_auth import post_user_info
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# FastMCP server — resource/relying side
+# ScalekitProvider validates every token on tool calls.
+# ---------------------------------------------------------------------------
+
+mcp = FastMCP(
+    "BYOA Todo Server",
+    auth=ScalekitProvider(
+        environment_url=os.getenv("SCALEKIT_ENVIRONMENT_URL"),
+        resource_id=os.getenv("SCALEKIT_RESOURCE_ID"),
+        # FastMCP appends /mcp automatically; keep base URL with trailing slash.
+        base_url=os.getenv("MCP_BASE_URL"),
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Todo tools (in-memory CRUD, scope-gated)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TodoItem:
+    id: str
+    title: str
+    description: Optional[str]
+    completed: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+_TODO_STORE: dict[str, TodoItem] = {}
+
+
+def _require_scope(scope: str) -> Optional[str]:
+    """Return an error string if the active token lacks the given scope."""
+    token: AccessToken = get_access_token()
+    if scope not in token.scopes:
+        return f"Insufficient permissions: `{scope}` scope required."
+    return None
+
+
+@mcp.tool
+def create_todo(title: str, description: Optional[str] = None) -> dict:
+    """Create a new todo item."""
+    error = _require_scope("todo:write")
+    if error:
+        return {"error": error}
+    todo = TodoItem(id=str(uuid.uuid4()), title=title, description=description)
+    _TODO_STORE[todo.id] = todo
+    return {"todo": todo.to_dict()}
+
+
+@mcp.tool
+def list_todos(completed: Optional[bool] = None) -> dict:
+    """List all todos, optionally filtering by completion state."""
+    error = _require_scope("todo:read")
+    if error:
+        return {"error": error}
+    todos = [
+        t.to_dict() for t in _TODO_STORE.values()
+        if completed is None or t.completed == completed
+    ]
+    return {"todos": todos}
+
+
+@mcp.tool
+def get_todo(todo_id: str) -> dict:
+    """Fetch a single todo by its identifier."""
+    error = _require_scope("todo:read")
+    if error:
+        return {"error": error}
+    todo = _TODO_STORE.get(todo_id)
+    if todo is None:
+        return {"error": f"Todo `{todo_id}` not found."}
+    return {"todo": todo.to_dict()}
+
+
+@mcp.tool
+def update_todo(
+    todo_id: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    completed: Optional[bool] = None,
+) -> dict:
+    """Update fields on an existing todo."""
+    error = _require_scope("todo:write")
+    if error:
+        return {"error": error}
+    todo = _TODO_STORE.get(todo_id)
+    if todo is None:
+        return {"error": f"Todo `{todo_id}` not found."}
+    if title is not None:
+        todo.title = title
+    if description is not None:
+        todo.description = description
+    if completed is not None:
+        todo.completed = completed
+    return {"todo": todo.to_dict()}
+
+
+@mcp.tool
+def delete_todo(todo_id: str) -> dict:
+    """Remove a todo from the store."""
+    error = _require_scope("todo:write")
+    if error:
+        return {"error": error}
+    todo = _TODO_STORE.pop(todo_id, None)
+    if todo is None:
+        return {"error": f"Todo `{todo_id}` not found."}
+    return {"deleted": todo_id}
+
+
+# ---------------------------------------------------------------------------
+# Own-authentication-service — runtime config (set per test run via /configure)
+#
+# The test creates a fresh MCP server in Scalekit, copies the two URL templates,
+# then POSTs them here — no pre-configured env vars needed.  This mirrors the
+# test_mcp.py pattern where server_resource[0]/[1] are obtained fresh each run.
+# ---------------------------------------------------------------------------
+
+_CONFIGURE_SECRET = os.getenv("CONFIGURE_SECRET", "")  # required; protects /configure
+
+# Mutable state updated by /configure on each test run.
+_runtime: dict = {
+    "user_info_post_url_template": "",
+    "redirect_url_template":       "",
+    "test_user_sub":               "byoa-test-user-001",
+    "test_user_email":             "byoa-test@automation.example",
+}
+
+_LOGIN_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BYOA Login</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; display:flex; justify-content:center;
+            align-items:center; min-height:100vh; margin:0; background:#f0f2f5; }}
+    .card {{ background:#fff; border-radius:8px; padding:2rem; width:360px;
+             box-shadow:0 2px 8px rgba(0,0,0,.12); }}
+    h1 {{ font-size:1.2rem; margin:0 0 1.5rem; }}
+    label {{ display:block; font-size:.875rem; margin-bottom:.25rem; color:#555; }}
+    input[type=text], input[type=email] {{
+      width:100%; padding:.5rem .75rem; border:1px solid #ccc; border-radius:4px;
+      box-sizing:border-box; margin-bottom:1rem; font-size:1rem; }}
+    button {{ width:100%; padding:.625rem; background:#3b5bdb; color:#fff; border:none;
+              border-radius:4px; font-size:1rem; cursor:pointer; }}
+    button:hover {{ background:#2f4ac9; }}
+    .hint {{ font-size:.75rem; color:#999; margin-top:1rem; text-align:center; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Sign in to continue</h1>
+    <form method="post" action="/login">
+      <input type="hidden" name="login_request_id" value="{login_request_id}">
+      <input type="hidden" name="state"            value="{state}">
+      <label for="email">Email</label>
+      <input type="email" id="email" name="email" value="{test_email}" required>
+      <label for="sub">User ID (sub)</label>
+      <input type="text"  id="sub"   name="sub"   value="{test_sub}"   required>
+      <button type="submit">Sign in</button>
+    </form>
+    <p class="hint">Test stub — any submission is accepted by Scalekit.</p>
+  </div>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Own-authentication-service HTTP routes
+# ---------------------------------------------------------------------------
+
+@mcp.custom_route("/configure", methods=["POST"])
+async def configure(request: Request) -> Response:
+    """Called by the test right after creating a fresh MCP server in Scalekit.
+
+    Body (JSON):
+      {
+        "user_info_post_url_template": "...",   # contains {{login_request_id}}
+        "redirect_url_template":       "...",   # contains {{state_value}}
+        "test_user_sub":               "...",   # optional, defaults to env/fallback
+        "test_user_email":             "..."    # optional
+      }
+
+    Protected by X-Configure-Secret header (must match CONFIGURE_SECRET env var).
+    Returns 200 on success; 401 if secret wrong; 400 if required fields are missing.
+    """
+    if not _CONFIGURE_SECRET:
+        return PlainTextResponse(
+            "CONFIGURE_SECRET env var is not set on this server.", status_code=500
+        )
+    secret = request.headers.get("X-Configure-Secret", "")
+    if secret != _CONFIGURE_SECRET:
+        return PlainTextResponse("Unauthorized — wrong X-Configure-Secret.", status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return PlainTextResponse("Request body must be valid JSON.", status_code=400)
+
+    post_tmpl     = (body.get("user_info_post_url_template") or "").strip()
+    redirect_tmpl = (body.get("redirect_url_template")       or "").strip()
+
+    if not post_tmpl or not redirect_tmpl:
+        return PlainTextResponse(
+            "Both user_info_post_url_template and redirect_url_template are required.",
+            status_code=400,
+        )
+
+    _runtime["user_info_post_url_template"] = post_tmpl
+    _runtime["redirect_url_template"]       = redirect_tmpl
+    if body.get("test_user_sub"):
+        _runtime["test_user_sub"]   = body["test_user_sub"].strip()
+    if body.get("test_user_email"):
+        _runtime["test_user_email"] = body["test_user_email"].strip()
+
+    return PlainTextResponse("configured", status_code=200)
+
+
+@mcp.custom_route("/authorize", methods=["GET"])
+async def authorize(request: Request) -> Response:
+    """Scalekit redirects the MCP client's browser here during OAuth initiation.
+
+    VALIDATION (primary Scalekit-defect catch point):
+      Both login_request_id and state must be present and non-empty.
+      If Scalekit omits either, return 400 — never silently render the form.
+    Also guards that /configure was called before a real client can use this server.
+    """
+    if not _runtime["user_info_post_url_template"]:
+        return PlainTextResponse(
+            "BYOA server not configured — POST /configure with the MCP server "
+            "templates before connecting a client.",
+            status_code=503,
+        )
+
+    login_request_id = request.query_params.get("login_request_id", "").strip()
+    state            = request.query_params.get("state", "").strip()
+
+    missing = [p for p, v in [("login_request_id", login_request_id), ("state", state)] if not v]
+    if missing:
+        return PlainTextResponse(
+            f"BYOA /authorize: Scalekit redirect is missing required param(s): "
+            f"{', '.join(missing)}.\n"
+            "Expected both login_request_id and state in the query string.",
+            status_code=400,
+        )
+
+    return HTMLResponse(
+        _LOGIN_HTML.format(
+            login_request_id=login_request_id,
+            state=state,
+            test_email=_runtime["test_user_email"],
+            test_sub=_runtime["test_user_sub"],
+        )
+    )
+
+
+@mcp.custom_route("/login", methods=["POST"])
+async def login(request: Request) -> Response:
+    """Handle stub-login form submission.
+
+    1. POST user_info to Scalekit's post-user-info endpoint.
+    2. On 2xx → 302 to Scalekit's consent redirect URL.
+    3. On non-2xx → 502 showing Scalekit's status + full body verbatim
+       (primary Scalekit-defect catch point — never swallow).
+    """
+    form             = await request.form()
+    login_request_id = (form.get("login_request_id") or "").strip()
+    state            = (form.get("state")            or "").strip()
+    email            = (form.get("email")            or _runtime["test_user_email"]).strip()
+    sub              = (form.get("sub")              or _runtime["test_user_sub"]).strip()
+
+    if not login_request_id or not state:
+        return PlainTextResponse(
+            "BYOA /login: login_request_id and state are required form fields.",
+            status_code=400,
+        )
+
+    post_tmpl     = _runtime["user_info_post_url_template"]
+    redirect_tmpl = _runtime["redirect_url_template"]
+    if not post_tmpl or not redirect_tmpl:
+        return PlainTextResponse(
+            "BYOA server not configured — POST /configure first.",
+            status_code=503,
+        )
+
+    post_url     = post_tmpl.replace("{{login_request_id}}", login_request_id)
+    redirect_url = redirect_tmpl.replace("{{state_value}}", state)
+
+    user_info = {
+        "sub":            sub,
+        "email":          email,
+        "email_verified": True,
+        "given_name":     "BYOA",
+        "family_name":    "Test",
+        "name":           "BYOA Test",
+    }
+
+    resp = post_user_info(post_url, user_info)
+
+    if not resp.is_success:
+        # Show Scalekit's error verbatim — key Scalekit-defect catch surface.
+        return HTMLResponse(
+            "<pre style='font-family:monospace; padding:1rem'>"
+            "Scalekit post-user-info returned an error.\n\n"
+            f"URL:    {post_url}\n"
+            f"Status: {resp.status_code}\n\n"
+            f"Body:\n{resp.text}"
+            "</pre>",
+            status_code=502,
+        )
+
+    return RedirectResponse(redirect_url, status_code=302)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> Response:
+    """Health-check endpoint used by Render and load balancers."""
+    return PlainTextResponse("ok")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    mcp.run(
+        transport="http",
+        port=int(os.getenv("PORT", "3002")),
+        stateless_http=True,
+    )
