@@ -16,7 +16,8 @@ load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Module-level credentials + token cache
-# Defaults come from env vars; /configure can override for cross-env tests.
+# Defaults come from env vars (set once in Render).
+# /configure can override them when switching Scalekit environments.
 # ---------------------------------------------------------------------------
 _creds: dict = {
     "env_url":       os.getenv("SCALEKIT_ENVIRONMENT_URL", "").rstrip("/"),
