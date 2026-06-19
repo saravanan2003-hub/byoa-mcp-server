@@ -15,9 +15,25 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Module-level token cache
+# Module-level credentials + token cache
+# Defaults come from env vars; /configure can override for cross-env tests.
 # ---------------------------------------------------------------------------
+_creds: dict = {
+    "env_url":       os.getenv("SCALEKIT_ENVIRONMENT_URL", "").rstrip("/"),
+    "client_id":     os.getenv("SCALEKIT_CLIENT_ID", ""),
+    "client_secret": os.getenv("SCALEKIT_CLIENT_SECRET", ""),
+}
 _cache: dict = {"token": None, "expires_at": 0.0}
+
+
+def update_credentials(env_url: str, client_id: str, client_secret: str) -> None:
+    """Override M2M credentials at runtime (called by /configure for cross-env tests)."""
+    _creds["env_url"]       = env_url.rstrip("/")
+    _creds["client_id"]     = client_id
+    _creds["client_secret"] = client_secret
+    # Invalidate cached token so next call fetches a fresh one for the new env
+    _cache["token"]      = None
+    _cache["expires_at"] = 0.0
 
 
 def _get_m2m_token() -> str:
@@ -30,9 +46,9 @@ def _get_m2m_token() -> str:
     if _cache["token"] and now < _cache["expires_at"] - 30:
         return _cache["token"]
 
-    env_url       = os.environ["SCALEKIT_ENVIRONMENT_URL"].rstrip("/")
-    client_id     = os.environ["SCALEKIT_CLIENT_ID"]
-    client_secret = os.environ["SCALEKIT_CLIENT_SECRET"]
+    env_url       = _creds["env_url"] or os.environ["SCALEKIT_ENVIRONMENT_URL"].rstrip("/")
+    client_id     = _creds["client_id"] or os.environ["SCALEKIT_CLIENT_ID"]
+    client_secret = _creds["client_secret"] or os.environ["SCALEKIT_CLIENT_SECRET"]
 
     resp = httpx.post(
         f"{env_url}/oauth/token",

@@ -24,27 +24,36 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.server.auth.providers.scalekit import ScalekitProvider
 from fastmcp.server.dependencies import AccessToken, get_access_token
+from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
-from scalekit_auth import post_user_info
+from scalekit_auth import post_user_info, update_credentials
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
 # FastMCP server — resource/relying side
-# ScalekitProvider validates every token on tool calls.
+#
+# ScalekitProvider is initialised with placeholder values so the server starts
+# without any pre-configured resource ID. /configure replaces environment_url,
+# resource_id, and the JWTVerifier in-place before each test run — no restart
+# needed, one deployment handles all 3 Scalekit environments.
 # ---------------------------------------------------------------------------
+
+_DEFAULT_ENV_URL = os.getenv("SCALEKIT_ENVIRONMENT_URL", "https://placeholder.scalekit.com")
+_DEFAULT_RESOURCE_ID = "placeholder"
 
 mcp = FastMCP(
     "BYOA Todo Server",
     auth=ScalekitProvider(
-        environment_url=os.getenv("SCALEKIT_ENVIRONMENT_URL"),
-        resource_id=os.getenv("SCALEKIT_RESOURCE_ID"),
+        environment_url=_DEFAULT_ENV_URL,
+        resource_id=_DEFAULT_RESOURCE_ID,
         # FastMCP appends /mcp automatically; keep base URL with trailing slash.
-        base_url=os.getenv("MCP_BASE_URL"),
+        base_url=os.getenv("MCP_BASE_URL", "http://localhost:3002/"),
     ),
 )
 
@@ -216,21 +225,26 @@ async def configure(request: Request) -> Response:
 
     Body (JSON):
       {
-        "user_info_post_url_template": "...",   # contains {{login_request_id}}
-        "redirect_url_template":       "...",   # contains {{state_value}}
-        "test_user_sub":               "...",   # optional, defaults to env/fallback
-        "test_user_email":             "..."    # optional
+        "resource_id":                 "mcp_...",   # REQUIRED — changes every test run
+        "user_info_post_url_template": "...",        # REQUIRED — contains {{login_request_id}}
+        "redirect_url_template":       "...",        # REQUIRED — contains {{state_value}}
+        "environment_url":             "...",        # optional — override for diff SK env
+        "client_id":                   "...",        # optional — override M2M credentials
+        "client_secret":               "...",        # optional — override M2M credentials
+        "test_user_sub":               "...",        # optional
+        "test_user_email":             "..."         # optional
       }
 
-    Protected by X-Configure-Secret header (must match CONFIGURE_SECRET env var).
-    Returns 200 on success; 401 if secret wrong; 400 if required fields are missing.
+    Swaps the ScalekitProvider's resource_id + JWTVerifier in-place so one
+    deployment handles all 3 Scalekit environments without a restart.
+
+    Protected by X-Configure-Secret header. Returns 200 on success.
     """
     if not _CONFIGURE_SECRET:
         return PlainTextResponse(
             "CONFIGURE_SECRET env var is not set on this server.", status_code=500
         )
-    secret = request.headers.get("X-Configure-Secret", "")
-    if secret != _CONFIGURE_SECRET:
+    if request.headers.get("X-Configure-Secret", "") != _CONFIGURE_SECRET:
         return PlainTextResponse("Unauthorized — wrong X-Configure-Secret.", status_code=401)
 
     try:
@@ -238,21 +252,56 @@ async def configure(request: Request) -> Response:
     except Exception:
         return PlainTextResponse("Request body must be valid JSON.", status_code=400)
 
-    post_tmpl     = (body.get("user_info_post_url_template") or "").strip()
-    redirect_tmpl = (body.get("redirect_url_template")       or "").strip()
+    resource_id   = (body.get("resource_id")                    or "").strip()
+    post_tmpl     = (body.get("user_info_post_url_template")     or "").strip()
+    redirect_tmpl = (body.get("redirect_url_template")           or "").strip()
 
-    if not post_tmpl or not redirect_tmpl:
+    missing = [f for f, v in [
+        ("resource_id", resource_id),
+        ("user_info_post_url_template", post_tmpl),
+        ("redirect_url_template", redirect_tmpl),
+    ] if not v]
+    if missing:
         return PlainTextResponse(
-            "Both user_info_post_url_template and redirect_url_template are required.",
-            status_code=400,
+            f"Missing required fields: {', '.join(missing)}", status_code=400
         )
 
+    # --- Update URL templates + test user ---
     _runtime["user_info_post_url_template"] = post_tmpl
     _runtime["redirect_url_template"]       = redirect_tmpl
     if body.get("test_user_sub"):
         _runtime["test_user_sub"]   = body["test_user_sub"].strip()
     if body.get("test_user_email"):
         _runtime["test_user_email"] = body["test_user_email"].strip()
+
+    # --- Swap ScalekitProvider internals in-place ---
+    # environment_url: use override if provided, else keep current value
+    env_url = (body.get("environment_url") or "").strip().rstrip("/") \
+              or mcp.auth.environment_url
+
+    mcp.auth.environment_url = env_url
+    mcp.auth.resource_id     = resource_id
+
+    # Replace the JWTVerifier so token validation uses the new audience + JWKS
+    mcp.auth.token_verifier = JWTVerifier(
+        jwks_uri=f"{env_url}/keys",
+        issuer=env_url,
+        algorithm="RS256",
+        audience=resource_id,
+    )
+
+    # Update authorization_servers so protected-resource metadata points correctly
+    mcp.auth.authorization_servers = [
+        AnyHttpUrl(f"{env_url}/resources/{resource_id}")
+    ]
+
+    # --- Update M2M credentials if overridden (for cross-env tests) ---
+    if body.get("client_id") and body.get("client_secret"):
+        update_credentials(
+            env_url=env_url,
+            client_id=body["client_id"].strip(),
+            client_secret=body["client_secret"].strip(),
+        )
 
     return PlainTextResponse("configured", status_code=200)
 

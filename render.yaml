@@ -16,8 +16,6 @@ services:
         sync: false
       - key: SCALEKIT_CLIENT_SECRET
         sync: false
-      - key: SCALEKIT_RESOURCE_ID
-        sync: false
       - key: MCP_BASE_URL
         sync: false
       # Protects the /configure endpoint — generate a random secret and set here
