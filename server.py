@@ -415,6 +415,7 @@ async def health(_request: Request) -> Response:
 if __name__ == "__main__":
     mcp.run(
         transport="http",
+        host="0.0.0.0",
         port=int(os.getenv("PORT", "3002")),
         stateless_http=True,
     )
