@@ -351,11 +351,12 @@ async def authorize(request: Request) -> Response:
             )
         conn_id = _conn_id_from_template()
         env_url = mcp.auth.environment_url
-        login_request_id = create_auth_request(env_url, conn_id)
+        login_request_id, auth_req_err = create_auth_request(env_url, conn_id)
         if not login_request_id:
             return PlainTextResponse(
-                "BYOA /authorize: failed to create a Scalekit auth-request for the "
-                "PKCE flow — check M2M credentials and connection ID.",
+                f"BYOA /authorize: failed to create a Scalekit auth-request for the PKCE flow.\n"
+                f"env_url={env_url!r}  conn_id={conn_id!r}\n"
+                f"Error: {auth_req_err}",
                 status_code=502,
             )
         # state is already set from query params; fall through to render the form.

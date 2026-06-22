@@ -75,12 +75,12 @@ def _get_m2m_token() -> str:
     return token
 
 
-def create_auth_request(env_url: str, conn_id: str) -> str:
+def create_auth_request(env_url: str, conn_id: str) -> tuple:
     """Create a Scalekit auth-request for PKCE/MCP-OAuth2 flows.
 
-    Called by /authorize when Scalekit proxies an MCP client's PKCE request
-    without a login_request_id.  Returns the login_request_id string on success,
-    or an empty string if the API call fails (caller surfaces the error).
+    Returns (login_request_id, error_message).
+    On success: (non-empty string, "")
+    On failure: ("", descriptive error message)
     """
     try:
         token = _get_m2m_token()
@@ -91,10 +91,13 @@ def create_auth_request(env_url: str, conn_id: str) -> str:
             timeout=10,
         )
         if resp.is_success:
-            return resp.json().get("login_request_id", "")
-    except Exception:
-        pass
-    return ""
+            lr_id = resp.json().get("login_request_id", "")
+            if lr_id:
+                return lr_id, ""
+            return "", f"auth-requests API returned 2xx but no login_request_id in body: {resp.text}"
+        return "", f"auth-requests API returned HTTP {resp.status_code}: {resp.text}"
+    except Exception as exc:
+        return "", f"Exception calling auth-requests API (env={env_url!r}, conn={conn_id!r}): {exc}"
 
 
 def post_user_info(post_url: str, user_info: dict) -> httpx.Response:
