@@ -30,18 +30,109 @@ from fastmcp.server.dependencies import AccessToken, get_access_token
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.routing import Route
 
 from scalekit_auth import post_user_info, update_credentials
 
 load_dotenv()
 
+
+# ---------------------------------------------------------------------------
+# DynamicScalekitProvider — protected-resource metadata served live
+#
+# ScalekitProvider's parent (RemoteAuthProvider) calls create_protected_resource_routes()
+# at app-build time with a snapshot of authorization_servers.  Because this server
+# starts with placeholder values and /configure rewrites resource_id at runtime,
+# the frozen route would permanently advertise ".../resources/placeholder" — which
+# causes Scalekit to return HTTP 400 on RFC-8414 discovery and MCP clients that
+# follow RFC-9728 (e.g. Claude) to fall back to the base URL, bypassing Scalekit.
+#
+# This subclass overrides get_routes() to drop the frozen route and replace it
+# with a handler that builds ProtectedResourceMetadata fresh on every request
+# from the live self.resource_id — mirroring the existing dynamic AS-forwarder
+# (oauth_authorization_server_metadata, which is already a closure over self).
+# ---------------------------------------------------------------------------
+
+class DynamicScalekitProvider(ScalekitProvider):
+    """ScalekitProvider variant that serves protected-resource metadata dynamically.
+
+    Fixes the /configure-after-startup pattern: the default implementation
+    snapshots authorization_servers at app-build time and never reflects
+    later mutations.  This subclass re-reads self.resource_id on every
+    /.well-known/oauth-protected-resource/mcp request so the advertised
+    authorization_server is always the one set by /configure.
+    """
+
+    def get_routes(self, mcp_path=None):
+        # Let the parent install all routes — this handles the dynamic
+        # AS-forwarder, token-verification routes, etc.
+        routes = super().get_routes(mcp_path)
+
+        # Drop the frozen protected-resource route(s) built at startup.
+        routes = [
+            r for r in routes
+            if not (hasattr(r, "path") and r.path.startswith("/.well-known/oauth-protected-resource"))
+        ]
+
+        # Build the resource URL (parent already called set_mcp_path() above).
+        resource_url = self._get_resource_url(mcp_path)
+        if resource_url:
+            from urllib.parse import urlparse
+            from mcp.shared.auth import ProtectedResourceMetadata
+            from mcp.server.auth.json_response import PydanticJSONResponse
+            from mcp.server.auth.routes import cors_middleware, build_resource_metadata_url
+
+            provider = self  # close over the live provider instance
+
+            async def _dynamic_protected_resource_metadata(request):
+                """Serve RFC-9728 metadata using the live resource_id."""
+                metadata = ProtectedResourceMetadata(
+                    resource=resource_url,
+                    authorization_servers=[
+                        AnyHttpUrl(
+                            f"{provider.environment_url}/resources/{provider.resource_id}"
+                        )
+                    ],
+                    scopes_supported=(
+                        provider._scopes_supported
+                        if provider._scopes_supported is not None
+                        else provider.token_verifier.scopes_supported
+                    ),
+                    resource_name=provider.resource_name,
+                    resource_documentation=provider.resource_documentation,
+                )
+                return PydanticJSONResponse(
+                    content=metadata,
+                    # No-store: different resource_ids are issued each test run;
+                    # a cached document from a prior run would send the client to
+                    # the wrong authorization_server.
+                    headers={"Cache-Control": "no-store"},
+                )
+
+            metadata_url = build_resource_metadata_url(resource_url)
+            parsed = urlparse(str(metadata_url))
+            well_known_path = parsed.path
+
+            # Prepend so it wins over any stale route still in the list.
+            routes.insert(
+                0,
+                Route(
+                    well_known_path,
+                    endpoint=cors_middleware(_dynamic_protected_resource_metadata, ["GET", "OPTIONS"]),
+                    methods=["GET", "OPTIONS"],
+                ),
+            )
+
+        return routes
+
+
 # ---------------------------------------------------------------------------
 # FastMCP server — resource/relying side
 #
-# ScalekitProvider is initialised with placeholder values so the server starts
-# without any pre-configured resource ID. /configure replaces environment_url,
-# resource_id, and the JWTVerifier in-place before each test run — no restart
-# needed, one deployment handles all 3 Scalekit environments.
+# DynamicScalekitProvider is initialised with placeholder values so the server
+# starts without any pre-configured resource ID. /configure replaces
+# environment_url, resource_id, and the JWTVerifier in-place before each test
+# run — no restart needed, one deployment handles all 3 Scalekit environments.
 # ---------------------------------------------------------------------------
 
 _DEFAULT_ENV_URL = os.getenv("SCALEKIT_ENVIRONMENT_URL", "https://placeholder.scalekit.com")
@@ -49,7 +140,7 @@ _DEFAULT_RESOURCE_ID = "placeholder"
 
 mcp = FastMCP(
     "BYOA Todo Server",
-    auth=ScalekitProvider(
+    auth=DynamicScalekitProvider(
         environment_url=_DEFAULT_ENV_URL,
         resource_id=_DEFAULT_RESOURCE_ID,
         # FastMCP appends /mcp automatically; keep base URL with trailing slash.
