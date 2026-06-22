@@ -75,6 +75,28 @@ def _get_m2m_token() -> str:
     return token
 
 
+def create_auth_request(env_url: str, conn_id: str) -> str:
+    """Create a Scalekit auth-request for PKCE/MCP-OAuth2 flows.
+
+    Called by /authorize when Scalekit proxies an MCP client's PKCE request
+    without a login_request_id.  Returns the login_request_id string on success,
+    or an empty string if the API call fails (caller surfaces the error).
+    """
+    try:
+        token = _get_m2m_token()
+        resp = httpx.post(
+            f"{env_url.rstrip('/')}/api/v1/connections/{conn_id}/auth-requests",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+            timeout=10,
+        )
+        if resp.is_success:
+            return resp.json().get("login_request_id", "")
+    except Exception:
+        pass
+    return ""
+
+
 def post_user_info(post_url: str, user_info: dict) -> httpx.Response:
     """POST user_info to the Scalekit own-auth post-user-info endpoint.
 

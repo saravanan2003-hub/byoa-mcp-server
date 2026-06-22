@@ -18,6 +18,7 @@ Derived from github.com/scalekit-inc/mcp-auth-demos/tree/main/todo-fastmcp.
 """
 
 import os
+import re
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Optional
@@ -31,7 +32,7 @@ from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
-from scalekit_auth import post_user_info, update_credentials
+from scalekit_auth import create_auth_request, post_user_info, update_credentials
 
 load_dotenv()
 
@@ -306,14 +307,28 @@ async def configure(request: Request) -> Response:
     return PlainTextResponse("configured", status_code=200)
 
 
+def _conn_id_from_template() -> str:
+    """Extract the Scalekit connection ID from the configured user_info URL template."""
+    m = re.search(r"/connections/([^/]+)/auth-requests", _runtime.get("user_info_post_url_template", ""))
+    return m.group(1) if m else ""
+
+
 @mcp.custom_route("/authorize", methods=["GET"])
 async def authorize(request: Request) -> Response:
     """Scalekit redirects the MCP client's browser here during OAuth initiation.
 
-    VALIDATION (primary Scalekit-defect catch point):
-      Both login_request_id and state must be present and non-empty.
-      If Scalekit omits either, return 400 — never silently render the form.
-    Also guards that /configure was called before a real client can use this server.
+    Two entry paths:
+
+    1. Traditional BYOA redirect (ChatGPT, non-PKCE clients):
+       Scalekit manages the OAuth session and forwards BOTH login_request_id and
+       state.  Both must be present — missing either is a Scalekit defect → 400.
+
+    2. MCP OAuth 2.1 PKCE flow (Claude, spec-compliant clients):
+       Scalekit proxies the client's PKCE request without a login_request_id.
+       Detected by presence of response_type=code + client_id + absence of
+       login_request_id.  We call Scalekit's auth-requests API to create a new
+       auth-request and obtain a login_request_id, then render the same login
+       form.  The /login handler is identical for both paths.
     """
     if not _runtime["user_info_post_url_template"]:
         return PlainTextResponse(
@@ -324,15 +339,36 @@ async def authorize(request: Request) -> Response:
 
     login_request_id = request.query_params.get("login_request_id", "").strip()
     state            = request.query_params.get("state", "").strip()
+    response_type    = request.query_params.get("response_type", "").strip()
+    client_id_param  = request.query_params.get("client_id", "").strip()
 
-    missing = [p for p, v in [("login_request_id", login_request_id), ("state", state)] if not v]
-    if missing:
-        return PlainTextResponse(
-            f"BYOA /authorize: Scalekit redirect is missing required param(s): "
-            f"{', '.join(missing)}.\n"
-            "Expected both login_request_id and state in the query string.",
-            status_code=400,
-        )
+    if response_type == "code" and client_id_param and not login_request_id:
+        # MCP OAuth 2.1 PKCE flow — create a Scalekit auth-request to get login_request_id.
+        if not state:
+            return PlainTextResponse(
+                "BYOA /authorize: PKCE request is missing the required 'state' parameter.",
+                status_code=400,
+            )
+        conn_id = _conn_id_from_template()
+        env_url = mcp.auth.environment_url
+        login_request_id = create_auth_request(env_url, conn_id)
+        if not login_request_id:
+            return PlainTextResponse(
+                "BYOA /authorize: failed to create a Scalekit auth-request for the "
+                "PKCE flow — check M2M credentials and connection ID.",
+                status_code=502,
+            )
+        # state is already set from query params; fall through to render the form.
+    else:
+        # Traditional BYOA redirect — both params must be present (Scalekit defect catch).
+        missing = [p for p, v in [("login_request_id", login_request_id), ("state", state)] if not v]
+        if missing:
+            return PlainTextResponse(
+                f"BYOA /authorize: Scalekit redirect is missing required param(s): "
+                f"{', '.join(missing)}.\n"
+                "Expected both login_request_id and state in the query string.",
+                status_code=400,
+            )
 
     return HTMLResponse(
         _LOGIN_HTML.format(
