@@ -75,19 +75,22 @@ def _get_m2m_token() -> str:
     return token
 
 
-def create_auth_request(env_url: str, conn_id: str) -> tuple:
-    """Create a Scalekit auth-request for PKCE/MCP-OAuth2 flows.
+def create_auth_request(env_url: str, conn_id: str, pkce_params: dict) -> tuple:
+    """Create a Scalekit auth-request for a PKCE/MCP-OAuth2 flow.
+
+    Passes the full PKCE context so Scalekit can tie the new auth-request to
+    the Claude session that triggered this /authorize redirect.
 
     Returns (login_request_id, error_message).
     On success: (non-empty string, "")
-    On failure: ("", descriptive error message)
+    On failure: ("", descriptive error message with Scalekit's response body)
     """
     try:
         token = _get_m2m_token()
         resp = httpx.post(
             f"{env_url.rstrip('/')}/api/v1/connections/{conn_id}/auth-requests",
             headers={"Authorization": f"Bearer {token}"},
-            json={},
+            json=pkce_params,
             timeout=10,
         )
         if resp.is_success:
