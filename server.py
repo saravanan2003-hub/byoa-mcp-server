@@ -264,6 +264,12 @@ _runtime: dict = {
     "test_user_email":             "byoa-test@automation.example",
 }
 
+# Per-LRI template snapshot — fixes parallel-test race condition.
+# When /configure is called by multiple tests simultaneously, _runtime is overwritten.
+# We snapshot the templates at /authorize time (keyed by login_request_id) so that
+# /login always uses the templates that were current when *this* LRI was issued.
+_lri_templates: dict = {}  # {login_request_id: {post_tmpl, redirect_tmpl}}
+
 _LOGIN_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -424,6 +430,14 @@ async def authorize(request: Request) -> Response:
             status_code=400,
         )
 
+    # Snapshot the URL templates at /authorize time so /login uses the correct
+    # connection even when parallel tests overwrite _runtime["user_info_post_url_template"]
+    # between now and when the form is submitted.
+    _lri_templates[login_request_id] = {
+        "post_tmpl":     _runtime["user_info_post_url_template"],
+        "redirect_tmpl": _runtime["redirect_url_template"],
+    }
+
     return HTMLResponse(
         _LOGIN_HTML.format(
             login_request_id=login_request_id,
@@ -455,8 +469,10 @@ async def login(request: Request) -> Response:
             status_code=400,
         )
 
-    post_tmpl     = _runtime["user_info_post_url_template"]
-    redirect_tmpl = _runtime["redirect_url_template"]
+    # Use the per-LRI snapshot if present (parallel-test safety); fall back to global.
+    lri_state     = _lri_templates.pop(login_request_id, None)
+    post_tmpl     = lri_state["post_tmpl"]     if lri_state else _runtime["user_info_post_url_template"]
+    redirect_tmpl = lri_state["redirect_tmpl"] if lri_state else _runtime["redirect_url_template"]
     if not post_tmpl or not redirect_tmpl:
         return PlainTextResponse(
             "BYOA server not configured — POST /configure first.",
